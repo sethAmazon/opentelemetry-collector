@@ -29,6 +29,8 @@ import (
 // errTooManyBatchers is returned when the MetadataCardinalityLimit has been reached.
 var errTooManyBatchers = consumererror.NewPermanent(errors.New("too many batcher metadata-value combinations"))
 
+const oneMB = 1024 * 1024
+
 // batch_processor is a component that accepts spans and metrics, places them
 // into batches and sends downstream.
 //
@@ -38,10 +40,11 @@ var errTooManyBatchers = consumererror.NewPermanent(errors.New("too many batcher
 // - batch size reaches cfg.SendBatchSize
 // - cfg.Timeout is elapsed since the timestamp when the previous batch was sent out.
 type batchProcessor struct {
-	logger           *zap.Logger
-	timeout          time.Duration
-	sendBatchSize    int
-	sendBatchMaxSize int
+	logger                       *zap.Logger
+	timeout                      time.Duration
+	sendBatchSize                int
+	SendSerializationBatchSizeMB int
+	sendBatchMaxSize             int
 
 	// batchFunc is a factory for new batch objects corresponding
 	// with the appropriate signal.
@@ -103,6 +106,9 @@ type batch interface {
 
 	// add item to the current batch
 	add(item any)
+
+	// sizeInMB returns size in mb of the data
+	sizeInMB() int
 }
 
 var _ consumer.Traces = (*batchProcessor)(nil)
@@ -120,13 +126,14 @@ func newBatchProcessor(set processor.CreateSettings, cfg *Config, batchFunc func
 	bp := &batchProcessor{
 		logger: set.Logger,
 
-		sendBatchSize:    int(cfg.SendBatchSize),
-		sendBatchMaxSize: int(cfg.SendBatchMaxSize),
-		timeout:          cfg.Timeout,
-		batchFunc:        batchFunc,
-		shutdownC:        make(chan struct{}, 1),
-		metadataKeys:     mks,
-		metadataLimit:    int(cfg.MetadataCardinalityLimit),
+		sendBatchSize:                int(cfg.SendBatchSize),
+		SendSerializationBatchSizeMB: int(cfg.SendSerializationBatchSizeMB),
+		sendBatchMaxSize:             int(cfg.SendBatchMaxSize),
+		timeout:                      cfg.Timeout,
+		batchFunc:                    batchFunc,
+		shutdownC:                    make(chan struct{}, 1),
+		metadataKeys:                 mks,
+		metadataLimit:                int(cfg.MetadataCardinalityLimit),
 	}
 	if len(bp.metadataKeys) == 0 {
 		bp.batcher = &singleShardBatcher{batcher: bp.newShard(nil)}
@@ -185,7 +192,7 @@ func (b *shard) start() {
 	// timerCh ensures we only block when there is a
 	// timer, since <- from a nil channel is blocking.
 	var timerCh <-chan time.Time
-	if b.processor.timeout != 0 && b.processor.sendBatchSize != 0 {
+	if b.processor.timeout != 0 && (b.processor.sendBatchSize != 0 || b.processor.SendSerializationBatchSizeMB != 0) {
 		b.timer = time.NewTimer(b.processor.timeout)
 		timerCh = b.timer.C
 	}
@@ -225,7 +232,9 @@ func (b *shard) start() {
 func (b *shard) processItem(item any) {
 	b.batch.add(item)
 	sent := false
-	for b.batch.itemCount() > 0 && (!b.hasTimer() || b.batch.itemCount() >= b.processor.sendBatchSize) {
+	for b.batch.itemCount() > 0 && (!b.hasTimer() ||
+		(b.processor.sendBatchSize != 0 && b.batch.itemCount() >= b.processor.sendBatchSize) ||
+		(b.processor.SendSerializationBatchSizeMB != 0 && b.batch.sizeInMB() >= b.processor.SendSerializationBatchSizeMB)) {
 		sent = true
 		b.sendItems(triggerBatchSize)
 	}
@@ -411,6 +420,10 @@ func (bt *batchTraces) itemCount() int {
 	return bt.spanCount
 }
 
+func (bt *batchTraces) sizeInMB() int {
+	return bt.sizer.TracesSize(bt.traceData) / oneMB
+}
+
 type batchMetrics struct {
 	nextConsumer   consumer.Metrics
 	metricData     pmetric.Metrics
@@ -455,6 +468,10 @@ func (bm *batchMetrics) add(item any) {
 	}
 	bm.dataPointCount += newDataPointCount
 	md.ResourceMetrics().MoveAndAppendTo(bm.metricData.ResourceMetrics())
+}
+
+func (bm *batchMetrics) sizeInMB() int {
+	return bm.sizer.MetricsSize(bm.metricData) / oneMB
 }
 
 type batchLogs struct {
@@ -502,4 +519,8 @@ func (bl *batchLogs) add(item any) {
 	}
 	bl.logCount += newLogsCount
 	ld.ResourceLogs().MoveAndAppendTo(bl.logData.ResourceLogs())
+}
+
+func (bl *batchLogs) sizeInMB() int {
+	return bl.sizer.LogsSize(bl.logData) / oneMB
 }

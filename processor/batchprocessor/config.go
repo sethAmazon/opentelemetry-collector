@@ -23,6 +23,11 @@ type Config struct {
 	// subject to only send_batch_max_size.
 	SendBatchSize uint32 `mapstructure:"send_batch_size"`
 
+	// SendSerializationBatchSizeMB is the size of a batch serialized which after hit, will trigger it to be sent.
+	// When this is set to zero, the batch serialization size is ignored
+	// subject to only send_serialization_batch_size_mb.
+	SendSerializationBatchSizeMB uint32 `mapstructure:"send_serialization_batch_size_mb"`
+
 	// SendBatchMaxSize is the maximum size of a batch. It must be larger than SendBatchSize.
 	// Larger batches are split into smaller units.
 	// Default value is 0, that means no maximum size.
